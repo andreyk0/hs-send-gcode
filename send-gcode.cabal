@@ -1,0 +1,26 @@
+Name:                send-gcode
+Version:             0.1.0
+Synopsis:            Send GCode to 3D printer.
+
+Description:
+  Send GCode to 3D printer.
+
+Category:            Graphics
+Build-type:          Simple
+Cabal-version:       >=1.18
+
+
+Executable send-gcode
+  Default-Language: Haskell2010
+  Main-is: send-gcode/Main.hs
+
+  Build-depends: base              >= 4 && < 5
+               , cmdargs           >= 0.10.7
+               , serial            >= 0.1
+               , unix              >= 2.6
+               , text              >= 1.1
+               , SafeSemaphore     >= 0.9
+               , stm               >= 2.4
+               , text-format       >= 0.3
+
+  ghc-options: -O2 -Wall
