@@ -22,5 +22,6 @@ Executable send-gcode
                , SafeSemaphore     >= 0.9
                , stm               >= 2.4
                , text-format       >= 0.3
+               , transformers      >= 0.3
 
   ghc-options: -O2 -Wall

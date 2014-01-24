@@ -5,21 +5,28 @@ module Main (
   main
 ) where
 
+import Control.Concurrent
 import Control.Exception
+import Control.Monad
+
+import Data.Monoid
+
 import System.Console.CmdArgs
 import System.IO
+import System.Posix.Files
 import System.Posix.Terminal
 import System.Serial
-import Data.Monoid
-import Control.Concurrent
-import System.Posix.Files
 import System.Timeout
-import Control.Monad
 
 import Control.Monad.STM
 import Control.Concurrent.STM.TVar
 import Control.Concurrent.SSem (SSem)
 import qualified Control.Concurrent.SSem as SSem
+
+import Control.Monad.Trans.Reader
+import Control.Monad.IO.Class
+
+import Control.Applicative
 
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -61,57 +68,73 @@ data PrinterState =
                , shouldGenerateMonitoringCommands :: TVar Bool
                }
 
+
+type App = ReaderT PrinterState IO
+
+
 main :: IO ()
 main = do
   opts <- cmdArgs cmdLineOpts :: IO CmdLineOpts
   gcodeFileStatus <- getFileStatus (gcodePath opts)
-  endOfInputSem <- SSem.new 0
-  printerReaderExitSem <- SSem.new 0
 
-  withFile (gcodePath opts) ReadMode $ \gFH ->
-    withPrinterFile (printerPath opts) $ \pFH -> do
-      TIO.hPutStrLn pFH "M115" -- print firmware version / capabilities on connect
-      slBF <- atomically $ newTVar 0
-      gSize <- if (isRegularFile gcodeFileStatus)
-                 then hFileSize gFH
-                 else return 0
-      sentBytes <- atomically $ newTVar 0
-      pFeed <- atomically $ newTVar Nothing
-      ppFeed <- atomically $ newTVar Nothing
-      ssmc <- atomically $ newTVar True
-      let pState = PrinterState { gcodeFH = gFH
-                                , printerFH = pFH
-                                , gcodeTotalBytes = (gSize)
-                                , gcodeSentBytes = sentBytes
-                                , printerFeed = pFeed
-                                , printerPriorityFeed = ppFeed
-                                , endOfInputSemaphore = endOfInputSem
-                                , endOfOutputSemaphore = printerReaderExitSem
-                                , sendLineBufferFill = slBF
-                                , shouldGenerateMonitoringCommands = ssmc
-                                }
-      _ <- forkIO $ readPrinterOutput pState
-      _ <- forkIO $ feedPrinter pState
-      _ <- forkIO $ feedGcode pState 0
-      _ <- forkIO $ feedStdin pState
+  ps <-
+    withFile (gcodePath opts) ReadMode $ \gFH ->
+      withPrinterFile (printerPath opts) $ \pFH -> do
+        newPs <- (newPrinterState gFH pFH)
+        gSize <- if (isRegularFile gcodeFileStatus)
+                   then hFileSize gFH
+                   else return 0
+        let ps = newPs { gcodeTotalBytes = gSize }
 
-      if (monitor opts)
-        then do _ <- forkIO $ generateMonitoringCommands pState
-                return ()
-        else SSem.signal endOfInputSem
+        runReaderT (writePrinterLine "M115") ps -- print firmware version / capabilities on connect
+        _ <- forkIO $ runReaderT (readPrinterOutput) ps
+        _ <- forkIO $ runReaderT (feedPrinter) ps
+        _ <- forkIO $ runReaderT (feedGcode 0) ps
+        _ <- forkIO $ runReaderT (feedStdin) ps
 
-      debug "waiting for stdin/stdout to exit"
-      SSem.waitN endOfInputSem 2 -- stdin/gcode file
-      atomically $ writeTVar ssmc False
-      debug "waiting for monitor thread to exit"
-      SSem.wait endOfInputSem
-      debug "waiting for printer feed thread to exit"
-      sendCommand pState EndOfAllStreams
-      SSem.wait endOfInputSem
-      debug "input threads have exited"
+        if (monitor opts)
+          then do _ <- forkIO $ runReaderT (generateMonitoringCommands) ps
+                  return ()
+          else SSem.signal (endOfInputSemaphore ps)
 
+        runReaderT (waitForEndOfAllInput) ps
+        return ps
+
+  runReaderT (waitForEndOfAllOutput) ps
+
+newPrinterState :: Handle -- | gcode file handle
+                -> Handle -- | printer file handle
+                -> IO PrinterState
+newPrinterState gFH pFH =
+  (PrinterState) <$> (return gFH)
+                 <*> (return pFH)
+                 <*> (return 0)
+                 <*> (atomically $ newTVar 0)
+                 <*> (atomically $ newTVar Nothing)
+                 <*> (atomically $ newTVar Nothing)
+                 <*> (SSem.new 0)
+                 <*> (SSem.new 0)
+                 <*> (atomically $ newTVar 0)
+                 <*> (atomically $ newTVar True)
+
+waitForEndOfAllInput :: App ()
+waitForEndOfAllInput = do
+  ps <- ask
+  debug "waiting for stdin/stdout to exit"
+  liftIO $ SSem.waitN (endOfInputSemaphore ps) 2 -- stdin/gcode file
+  liftSTM $ writeTVar (shouldGenerateMonitoringCommands ps) False
+  debug "waiting for monitor thread to exit"
+  liftIO $ SSem.wait (endOfInputSemaphore ps)
+  debug "waiting for printer feed thread to exit"
+  sendCommand EndOfAllStreams
+  liftIO $ SSem.wait (endOfInputSemaphore ps)
+  debug "input threads have exited"
+
+waitForEndOfAllOutput :: App ()
+waitForEndOfAllOutput = do
+  ps <- ask
   debug "waiting for printer reader to exit"
-  SSem.wait printerReaderExitSem
+  liftIO $ SSem.wait (endOfOutputSemaphore ps)
   debug "all done"
 
 maxNumUnackLines :: Int
@@ -124,9 +147,10 @@ makeGcodeLine l =
       then Nothing
       else Just $ GCodeLine normalizedTxt
 
-sendCommand :: PrinterState -> PrinterCmd -> IO ()
-sendCommand ps pcmd =
-  atomically $ do
+sendCommand :: PrinterCmd -> App ()
+sendCommand pcmd = do
+  ps <- ask
+  liftSTM $ do
     bf <- readTVar (sendLineBufferFill ps)
     pf <- readTVar (printerFeed ps)
     if (bf < maxNumUnackLines)
@@ -136,90 +160,104 @@ sendCommand ps pcmd =
                 Just _ -> retry
       else retry
 
-sendPriorityCommand :: PrinterState -> PrinterCmd -> IO ()
-sendPriorityCommand ps pcmd = atomically $ do
-  ppf <- readTVar (printerPriorityFeed ps)
-  case ppf
-    of Nothing -> do modifyTVar' (sendLineBufferFill ps) (+1)
-                     writeTVar (printerPriorityFeed ps) (Just pcmd)
-       Just _ -> retry
+sendPriorityCommand :: PrinterCmd -> App ()
+sendPriorityCommand pcmd = do
+  ps <- ask
+  liftSTM $ do
+    ppf <- readTVar (printerPriorityFeed ps)
+    case ppf
+      of Nothing -> do modifyTVar' (sendLineBufferFill ps) (+1)
+                       writeTVar (printerPriorityFeed ps) (Just pcmd)
+         Just _ -> retry
 
-feedStdin :: PrinterState -> IO ()
-feedStdin pState = do
-  isOpen <- hIsOpen stdin
-  isEof <- hIsEOF stdin
+feedStdin :: App ()
+feedStdin = do
+  isOpen <- liftIO $ hIsOpen stdin
+  isEof <- liftIO $ hIsEOF stdin
   if (isOpen && (not isEof))
-    then do line <- TIO.hGetLine stdin
+    then do line <- liftIO $ TIO.hGetLine stdin
             case makeGcodeLine line
-              of Just gcl -> sendPriorityCommand pState gcl
+              of Just gcl -> sendPriorityCommand gcl
                  Nothing -> return ()
-            feedStdin pState
-    else sendCommand pState EndOfStream
+            feedStdin
+    else sendCommand EndOfStream
 
-feedGcode :: PrinterState -> Int -> IO ()
-feedGcode pState lineCounter = do
-  isOpen <- hIsOpen (gcodeFH pState)
-  isEof <- hIsEOF (gcodeFH pState)
+feedGcode :: Int -> App ()
+feedGcode lineCounter = do
+  ps <- ask
+  isOpen <- liftIO $ hIsOpen (gcodeFH ps)
+  isEof <- liftIO $ hIsEOF (gcodeFH ps)
 
   if (isOpen && (not isEof))
-    then do line <- TIO.hGetLine (gcodeFH pState)
-            atomically $ modifyTVar (gcodeSentBytes pState) (+ (T.length line))
+    then do line <- liftIO $ TIO.hGetLine (gcodeFH ps)
+            liftSTM $ modifyTVar (gcodeSentBytes ps) (+ (T.length line))
             when (lineCounter `mod` 100 == 0) $
-              progress pState
+              progress
             case makeGcodeLine line
-              of Just gcl -> sendCommand pState gcl
+              of Just gcl -> sendCommand gcl
                  Nothing -> return ()
-            feedGcode pState (lineCounter +1)
-    else sendCommand pState EndOfStream
+            feedGcode (lineCounter +1)
+    else sendCommand EndOfStream
 
-generateMonitoringCommands :: PrinterState -> IO ()
-generateMonitoringCommands pState = do
-  ssmc <- atomically $ readTVar (shouldGenerateMonitoringCommands pState)
+generateMonitoringCommands :: App ()
+generateMonitoringCommands = do
+  ps <- ask
+  ssmc <- liftSTM $ readTVar (shouldGenerateMonitoringCommands ps)
   if (ssmc)
-    then do sendCommand pState $ GCodeLine "M105" -- 'normal' commands, marlin prints progress when it waits for temperature
-            sendCommand pState $ GCodeLine "M114"
-            threadDelay 5000000
-            generateMonitoringCommands pState
-    else sendCommand pState EndOfStream
+    then do sendCommand $ GCodeLine "M105" -- 'normal' commands, marlin prints progress when it waits for temperature
+            sendCommand $ GCodeLine "M114"
+            liftIO $ threadDelay 5000000
+            generateMonitoringCommands
+    else sendCommand EndOfStream
 
-feedPrinter :: PrinterState -> IO ()
-feedPrinter pState = do
-  cmd <- atomically $ do
-           ppf <- readTVar (printerPriorityFeed pState)
-           pf <- readTVar (printerFeed pState)
+feedPrinter :: App ()
+feedPrinter = do
+  ps <- ask
+  cmd <- liftSTM $ do
+           ppf <- readTVar (printerPriorityFeed ps)
+           pf <- readTVar (printerFeed ps)
            case ppf
-             of Just c -> do writeTVar (printerPriorityFeed pState) Nothing
+             of Just c -> do writeTVar (printerPriorityFeed ps) Nothing
                              return c
                 Nothing -> case pf
-                             of Just c -> do writeTVar (printerFeed pState) Nothing
+                             of Just c -> do writeTVar (printerFeed ps) Nothing
                                              return c
                                 Nothing -> retry
 
   debug $ "feedPrinter(" <> (T.pack . show) cmd <> ")"
+
   case cmd
-    of EndOfStream -> do SSem.signal (endOfInputSemaphore pState)
-                         sv <- SSem.getValue (endOfInputSemaphore pState)
+    of EndOfStream -> do sv <- liftIO $ do SSem.signal (endOfInputSemaphore ps)
+                                           SSem.getValue (endOfInputSemaphore ps)
                          debug $ "EOS: " <> (T.pack .show) sv
-                         feedPrinter pState
+                         feedPrinter
 
-       EndOfAllStreams -> SSem.signal (endOfInputSemaphore pState)
+       EndOfAllStreams -> liftIO $ SSem.signal (endOfInputSemaphore ps)
 
-       GCodeLine l -> do TIO.hPutStrLn (printerFH pState) l
-                         hFlush (printerFH pState)
-                         feedPrinter pState
+       GCodeLine l -> do writePrinterLine l
+                         feedPrinter
 
-readPrinterOutput :: PrinterState -> IO ()
-readPrinterOutput pState = do
-  isOpen <- hIsOpen (printerFH pState)
+readPrinterOutput :: App ()
+readPrinterOutput = do
+  ps <- ask
+  isOpen <- liftIO $ hIsOpen (printerFH ps)
   if (isOpen)
-   then do maybeLine <- timeout (1000000) $ TIO.hGetLine (printerFH pState)
+   then do maybeLine <- liftIO $ timeout (1000000) $ TIO.hGetLine (printerFH ps)
            case maybeLine
-             of Just line -> do when (T.isPrefixOf "ok" line) $ do
-                                  atomically $ modifyTVar' (sendLineBufferFill pState) (\i -> i-1)
+             of Just line -> do liftIO $ when (T.isPrefixOf "ok" line) $ do
+                                  atomically $ modifyTVar' (sendLineBufferFill ps) (\i -> i-1)
                                 printerResponse line
-                                readPrinterOutput pState
-                Nothing -> readPrinterOutput pState -- check conditions again
-   else SSem.signal (endOfOutputSemaphore pState)
+                                readPrinterOutput
+                Nothing -> readPrinterOutput -- check conditions again
+   else liftIO $ SSem.signal (endOfOutputSemaphore ps)
+
+
+writePrinterLine :: Text -> App ()
+writePrinterLine l = do
+  ps <- ask
+  liftIO $ do
+    TIO.hPutStrLn (printerFH ps) l
+    hFlush (printerFH ps)
 
 withPrinterFile :: FilePath -> (Handle -> IO a) -> IO a
 withPrinterFile pfp act = do
@@ -232,19 +270,23 @@ openPrinterSerialPort pfp = do
   hSetBinaryMode fh True
   return fh
 
-debug :: Text -> IO ()
-debug t = TIO.hPutStrLn stdout $ "DEBUG: " <> t
+liftSTM :: STM a -> App a
+liftSTM = liftIO . atomically
 
-progress :: PrinterState -> IO ()
-progress pState = do
-  let tb = fromIntegral (gcodeTotalBytes pState) :: Double
-  sb <- atomically $ readTVar (gcodeSentBytes pState) >>= return . fromIntegral :: IO Double
+debug :: Text -> App ()
+debug t = liftIO $ TIO.hPutStrLn stdout $ "DEBUG: " <> t
+
+progress :: App ()
+progress = do
+  ps <- ask
+  let tb = fromIntegral (gcodeTotalBytes ps) :: Double
+  sb <- liftSTM $ readTVar (gcodeSentBytes ps) >>= return . fromIntegral
   let pct = (sb / (1 + tb)) * 100.0
       pctTxt = TL.toStrict . TLB.toLazyText $ TF.fixed 2 pct
-  TIO.hPutStrLn stdout $ "PROGRESS: " <> pctTxt
+  liftIO $ TIO.hPutStrLn stdout $ "PROGRESS: " <> pctTxt
 
-printerResponse :: Text -> IO ()
-printerResponse t = when (t /= "ok") $ do -- print all but trivial responses
+printerResponse :: Text -> App ()
+printerResponse t = liftIO $ when (t /= "ok") $ do -- print all but trivial responses
   case T.stripPrefix "ok " t
     of Just x  -> TIO.putStrLn $ "PRINTER: " <> x
        Nothing -> TIO.putStrLn $ "PRINTER: " <> t
