@@ -249,8 +249,9 @@ executeEmergencyShutdown :: App ()
 executeEmergencyShutdown = do
   ps <- getPrinterState
   liftSTM $ modifyTVar' (sendLineBufferFill ps) (+ (maxNumUnackLines+1)) -- block all remaining normal input while process is stopping
-  forM_ [ GCD.fanOff
-        , GCD.extruderTemperatureOff
+  forM_ [ GCD.extruderTemperatureOff
+        , GCD.bedTemperatureOff
+        , GCD.fanOff
         , GCD.disableMotors
         , GCD.emergencyStop
         ] (sendPriorityCommand . GCodeLine)

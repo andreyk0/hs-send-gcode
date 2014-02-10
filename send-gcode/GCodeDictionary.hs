@@ -24,5 +24,8 @@ fanOff = "M107"
 extruderTemperatureOff :: Text
 extruderTemperatureOff = "M104 S0"
 
+bedTemperatureOff :: Text
+bedTemperatureOff = "M140 S0"
+
 disableMotors :: Text
 disableMotors = "M84"
