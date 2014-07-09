@@ -39,34 +39,33 @@ main = do
   opts <- cmdArgs cmdLineOpts :: IO CmdLineOpts
   gcodeFileStatus <- getFileStatus (gcodePath opts)
 
-  ps <-
-    withFile (gcodePath opts) ReadMode $ \gFH ->
-      withPrinterFile (printerPath opts) $ \pFH -> do
-        gSize <- if (isRegularFile gcodeFileStatus)
-                   then hFileSize gFH
-                   else return 0
-        ps <- (newPrinterState gFH pFH gSize (verbose opts))
+  withFile (gcodePath opts) ReadMode $ \gFH ->
+    withPrinterFile (printerPath opts) $ \pFH -> do
+      gSize <- if (isRegularFile gcodeFileStatus)
+                 then hFileSize gFH
+                 else return 0
+      ps <- (newPrinterState gFH pFH gSize (verbose opts))
 
-        runApp ps $ do
-          printFirmwareVersion
-          when (not (monitor opts))
-            stopGeneratingMonitoringCommands
+      runApp ps $ do
+        printFirmwareVersion
+        when (not (monitor opts))
+          stopGeneratingMonitoringCommands
 
-        _ <- forkIO $ runApp ps (readPrinterOutput)
-        _ <- forkIO $ runApp ps (feedPrinter)
-        _ <- forkIO $ runApp ps (feedGcode 0)
-        _ <- forkIO $ runApp ps (feedStdin)
-        _ <- forkIO $ runApp ps (generateMonitoringCommands)
+      rpot <- forkIO $ runApp ps (readPrinterOutput)
+      _ <- forkIO $ runApp ps (feedPrinter)
+      _ <- forkIO $ runApp ps (feedGcode 0)
+      _ <- forkIO $ runApp ps (feedStdin)
+      _ <- forkIO $ runApp ps (generateMonitoringCommands)
 
-        catchJust (\e -> case e
-                           of UserInterrupt -> Just ()
-                              _             -> Nothing)
-                  (runApp ps (waitForEndOfAllInput))
-                  (\_ -> runApp ps (executeEmergencyShutdown))
+      catchJust (\e -> case e
+                         of UserInterrupt -> Just ()
+                            _             -> Nothing)
+                (runApp ps (waitForEndOfAllInput))
+                (\_ -> runApp ps (executeEmergencyShutdown))
 
-        return ps
+      killThread rpot -- it reads in a loop with large timeout, interrupt if we are at the very end
 
-  runApp ps (waitForEndOfAllOutput)
+  return ()
 
 withPrinterFile :: FilePath -> (Handle -> IO a) -> IO a
 withPrinterFile pfp act =
@@ -77,5 +76,7 @@ openPrinterSerialPort pfp = do
   fh <- openSerial pfp B115200 8 One NoParity NoFlowControl
   hSetEcho fh False
   hSetBinaryMode fh True
+  --hSetBuffering fh NoBuffering
+  hSetBuffering fh $ LineBuffering
   return fh
 

@@ -15,7 +15,6 @@ module App (
   , generateMonitoringCommands
   , stopGeneratingMonitoringCommands
   , waitForEndOfAllInput
-  , waitForEndOfAllOutput
 ) where
 
 import Control.Concurrent
@@ -59,15 +58,15 @@ data PrinterState =
                , printerFeed :: TVar (Maybe PrinterCmd)
                , printerPriorityFeed :: TVar (Maybe PrinterCmd)
                , endOfInputSemaphore :: SSem -- we count it up every time we reach an end of stream
-               , endOfOutputSemaphore :: SSem -- to signal exit from printer reader thread
                , sendLineBufferFill :: TVar Int -- this is to throttle how fast we feed gcode from the file
                , shouldGenerateMonitoringCommands :: TVar Bool
+               , shouldContinueReadingPrinterOutput :: TVar Bool
                , verbose :: Bool -- turns on debug log
                }
 
 
 newtype App a = SGApp { runSGApp :: ReaderT PrinterState IO a
-                      } deriving (Monad, MonadIO)
+                      } deriving (Applicative, Functor, Monad, MonadIO)
 
 getPrinterState :: App PrinterState
 getPrinterState = SGApp (ask)
@@ -88,8 +87,8 @@ newPrinterState gFH pFH gSize verb =
                  <*> (atomically $ newTVar Nothing)
                  <*> (atomically $ newTVar Nothing)
                  <*> (SSem.new 0)
-                 <*> (SSem.new 0)
                  <*> (atomically $ newTVar 0)
+                 <*> (atomically $ newTVar True)
                  <*> (atomically $ newTVar True)
                  <*> (return verb)
 
@@ -105,13 +104,7 @@ waitForEndOfAllInput = do
   sendCommand EndOfAllStreams
   liftIO $ SSem.wait (endOfInputSemaphore ps)
   logDebug "input threads have exited"
-
-waitForEndOfAllOutput :: App ()
-waitForEndOfAllOutput = do
-  ps <- getPrinterState
-  logDebug "waiting for printer reader to exit"
-  liftIO $ SSem.wait (endOfOutputSemaphore ps)
-  logDebug "all done"
+  stopReadingPrinterOutput
 
 maxNumUnackLines :: Int
 maxNumUnackLines = 2
@@ -192,6 +185,11 @@ stopGeneratingMonitoringCommands = do
   ps <- getPrinterState
   liftSTM $ writeTVar (shouldGenerateMonitoringCommands ps) False
 
+stopReadingPrinterOutput :: App ()
+stopReadingPrinterOutput = do
+  ps <- getPrinterState
+  liftSTM $ writeTVar (shouldContinueReadingPrinterOutput ps) False
+
 feedPrinter :: App ()
 feedPrinter = do
   ps <- getPrinterState
@@ -206,40 +204,48 @@ feedPrinter = do
                                              return c
                                 Nothing -> retry
 
-  logDebug $ "feedPrinter(" <> (T.pack . show) cmd <> ")"
+  logDebug $ "feedPrinter(" <> tshow cmd <> ")"
 
   case cmd
     of EndOfStream -> do sv <- liftIO $ do SSem.signal (endOfInputSemaphore ps)
                                            SSem.getValue (endOfInputSemaphore ps)
-                         logDebug $ "EOS: " <> (T.pack .show) sv
+                         logDebug $ "EOS: " <> tshow sv
+                         countDownBufferFill ps
                          feedPrinter
 
-       EndOfAllStreams -> liftIO $ SSem.signal (endOfInputSemaphore ps)
+       EndOfAllStreams -> do liftIO $ SSem.signal (endOfInputSemaphore ps)
+                             countDownBufferFill ps
 
        GCodeLine l -> do writePrinterLine l
                          feedPrinter
 
-  where writePrinterLine :: Text -> App ()
-        writePrinterLine l = do
+  where writePrinterLine l = do
           ps <- getPrinterState
           liftIO $ do
             TIO.hPutStrLn (printerFH ps) l
             hFlush (printerFH ps)
 
+        countDownBufferFill ps = liftSTM $ modifyTVar' (sendLineBufferFill ps) (\i -> i-1)
+
 
 readPrinterOutput :: App ()
 readPrinterOutput = do
   ps <- getPrinterState
-  isOpen <- liftIO $ hIsOpen (printerFH ps)
-  if (isOpen)
-   then do maybeLine <- liftIO $ timeout (1000000) $ TIO.hGetLine (printerFH ps)
-           case maybeLine
-             of Just line -> do when (T.isPrefixOf "ok" line) $
-                                  liftSTM $ modifyTVar' (sendLineBufferFill ps) (\i -> i-1)
-                                logPrinterResponse line
-                                readPrinterOutput
-                Nothing -> readPrinterOutput -- check conditions again
-   else liftIO $ SSem.signal (endOfOutputSemaphore ps)
+  maybeLine <- liftIO $ timeout (60000000) $ TIO.hGetLine (printerFH ps)
+
+  case maybeLine
+    of Just line -> do when (T.isPrefixOf "ok" line) $
+                         liftSTM $ modifyTVar' (sendLineBufferFill ps) (\i -> i-1)
+                       logPrinterResponse line
+                       nextStep ps
+       Nothing   -> do currentFill <- liftSTM $ readTVar (sendLineBufferFill ps)
+                       liftIO $ TIO.hPutStrLn stdout $ "PRINTER READ TIMEOUT, current fill (" <> tshow currentFill <> ") out of (" <> tshow maxNumUnackLines <> "), executing emergency stop ..."
+                       executeEmergencyShutdown
+                       nextStep ps
+
+  where nextStep :: PrinterState -> App ()
+        nextStep ps = do shouldRecurse <- liftSTM $ readTVar (shouldContinueReadingPrinterOutput ps)
+                         if shouldRecurse then readPrinterOutput else return ()
 
 -- print firmware version / capabilities on connect
 printFirmwareVersion :: App ()
@@ -262,8 +268,9 @@ liftSTM = liftIO . atomically
 logDebug :: Text -> App ()
 logDebug t = do
   ps <- getPrinterState
+  currentFill <- liftSTM $ readTVar (sendLineBufferFill ps)
   when (verbose ps) $
-    liftIO $ TIO.hPutStrLn stdout $ "DEBUG: " <> t
+    liftIO $ TIO.hPutStrLn stdout $ "DEBUG: " <> t <> " fill(" <> tshow currentFill <> ") out of (" <> tshow maxNumUnackLines <> ")"
 
 logProgress :: App ()
 logProgress = do
@@ -279,7 +286,10 @@ logProgress = do
   liftIO $ TIO.hPutStrLn stdout $ "PROGRESS: " <> pctTxt
 
 logPrinterResponse :: Text -> App ()
-logPrinterResponse t = liftIO $ when (t /= "ok") $ do -- print all but trivial responses
+logPrinterResponse t = liftIO $ when (t /= "ok" && not (T.null t)) $ do -- print all but trivial responses
   case T.stripPrefix "ok " t
     of Just x  -> TIO.putStrLn $ "PRINTER: " <> x
        Nothing -> TIO.putStrLn $ "PRINTER: " <> t
+
+tshow :: (Show a) => a -> Text
+tshow = T.pack . show
